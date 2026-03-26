@@ -1,6 +1,6 @@
 # Camera Test Bench — Installation Guide
 
-This guide is written for operators with no programming background.
+This guide is written for operators.
 Follow every step in order. Do not skip any step.
 
 ---
@@ -99,7 +99,7 @@ The Camera Test Bench window will open. Follow the on-screen instructions.
 | Camera not found in Pylon Viewer | Try a different USB port; reinstall Pylon drivers |
 | `ModuleNotFoundError: pypylon` | Run `pip install pypylon` in Command Prompt |
 | Window opens but camera feed is black | Increase `exposure` value in `configs/system_config.json` |
-| PyQt5 error on startup | Run `pip install PyQt5` in Command Prompt |
+| PyQt5 error on startup | Run `pip install PyQt5` or `pip install opencv-python-headless PyQt5` in Command Prompt |
 
 ---
 ---
