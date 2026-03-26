@@ -1,0 +1,40 @@
+{
+    "template": "camera_test_bench",
+    "cameras": {
+        "cam_id": "camera_01",
+        "camera_01": {
+            "model": "basler",
+            "serial_num": "",
+            "exposure": 10000,
+            "trigger_mode": "software",
+            "framerate": 10,
+            "grab_timeout": 5000,
+            "gain_auto": "Off",
+            "balance_white_auto": "Off",
+            "trigger_selector": "FrameStart",
+            "trigger_activation": "RisingEdge",
+            "trigger_source": "Line1"
+        }
+    },
+    "test_bench": {
+        "live_feed_window": "Camera Test Bench - Live Feed",
+        "capture_key": 32,
+        "quit_key": 113,
+        "capture_verify_threshold": 10,
+        "sharpness_threshold": 50.0,
+        "aperture_steps": ["low", "correct", "high"],
+        "aperture_exposures": {
+            "low": 3000,
+            "correct": 10000,
+            "high": 30000
+        },
+        "hardware_trigger_timeout": 30000,
+        "results_dir": "results"
+    },
+    "logging": {
+        "log_dir": "logs",
+        "log_level": "INFO",
+        "app_name": "CameraTestBench",
+        "backup_days": 14
+    }
+}

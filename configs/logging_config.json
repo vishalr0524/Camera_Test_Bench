@@ -1,0 +1,8 @@
+{
+    "logging": {
+        "log_dir": "logs",
+        "log_level": "INFO",
+        "app_name": "CameraTestBench",
+        "backup_days": 14
+    }
+}
