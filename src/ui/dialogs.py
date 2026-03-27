@@ -1,15 +1,19 @@
 """
-Modal dialogs for Camera Test Bench v2 UI.
+Modal dialogs for Camera Test Bench v3 UI.
+
+New in v3:
+  TriggerCountDialog  — step 8: operator enters how many hardware triggers to capture
+  HwTriggerProgressDialog — step 8: live progress bar while captures arrive
 """
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QFont
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QListWidget, QListWidgetItem,
-    QFrame, QDialogButtonBox,
+    QFrame, QProgressBar, QSpinBox,
 )
 
 from src.ui.widgets import (
@@ -55,6 +59,15 @@ DIALOG_STYLE = f"""
         padding: 8px;
         font-size: 14px;
     }}
+    QSpinBox {{
+        background: {CLR_ACCENT};
+        color: {CLR_TEXT};
+        border: 1px solid {CLR_BORDER};
+        border-radius: 6px;
+        padding: 8px;
+        font-size: 18px;
+        min-height: 40px;
+    }}
     QListWidget {{
         background: {CLR_ACCENT};
         color: {CLR_TEXT};
@@ -64,6 +77,19 @@ DIALOG_STYLE = f"""
     }}
     QListWidget::item:selected {{
         background: {CLR_PRIMARY};
+    }}
+    QProgressBar {{
+        background: {CLR_ACCENT};
+        border: 1px solid {CLR_BORDER};
+        border-radius: 6px;
+        text-align: center;
+        color: {CLR_TEXT};
+        font-size: 13px;
+        min-height: 28px;
+    }}
+    QProgressBar::chunk {{
+        background: {CLR_SUCCESS};
+        border-radius: 5px;
     }}
 """
 
@@ -116,7 +142,6 @@ class SerialInputDialog(QDialog):
             self._edit.setText(available[0])
         layout.addWidget(self._edit)
 
-        # Clicking a list item fills the text field
         self._list.currentTextChanged.connect(
             lambda t: self._edit.setText(t.strip())
         )
@@ -131,7 +156,7 @@ class SerialInputDialog(QDialog):
         layout.addLayout(btn_row)
 
         self._btn_confirm.clicked.connect(self._confirm)
-        self._btn_rescan.clicked.connect(self.reject)   # caller rescans and re-opens
+        self._btn_rescan.clicked.connect(self.reject)
         self._edit.returnPressed.connect(self._confirm)
 
         if not available:
@@ -163,16 +188,13 @@ class CaptureConfirmDialog(QDialog):
         passed = "warning" not in details and "error" not in details
         verdict = "CAPTURE OK  ✓" if passed else "CAPTURE — Review Required"
         v_color = CLR_SUCCESS if passed else CLR_WARNING
-        vlbl = make_label(verdict, 15, bold=True, color=v_color)
-        layout.addWidget(vlbl)
+        layout.addWidget(make_label(verdict, 15, bold=True, color=v_color))
 
-        # Image preview
         img_lbl = QLabel()
         img_lbl.setAlignment(Qt.AlignCenter)
         img_lbl.setPixmap(_frame_to_pixmap(frame))
         layout.addWidget(img_lbl)
 
-        # Metrics grid
         metrics_frame = QFrame()
         metrics_frame.setStyleSheet(
             f"background: {CLR_PANEL}; border-radius: 6px; padding: 8px;"
@@ -181,8 +203,8 @@ class CaptureConfirmDialog(QDialog):
         mf_layout.setSpacing(4)
 
         rows = [
-            ("Resolution",  details.get("resolution",    "—")),
-            ("Sharpness",   str(details.get("sharpness", "—"))),
+            ("Resolution",  details.get("resolution",     "—")),
+            ("Sharpness",   str(details.get("sharpness",  "—"))),
             ("Intensity",   str(details.get("mean_intensity", "—"))),
         ]
         if "warning" in details:
@@ -198,7 +220,6 @@ class CaptureConfirmDialog(QDialog):
             mf_layout.addLayout(row)
         layout.addWidget(metrics_frame)
 
-        # Buttons
         btn_row = QHBoxLayout()
         self._btn_retake = QPushButton("Retake  ↩")
         self._btn_retake.setObjectName("retake_btn")
@@ -307,16 +328,20 @@ class ApertureSummaryDialog(QDialog):
 # ------------------------------------------------------------------ #
 
 class ProceedDialog(QDialog):
-    """Generic 'press ENTER to continue' dialog."""
+    """Generic 'click Continue' dialog — used for step 7 hardware trigger info."""
 
     TITLES = {
         "hw_trigger_ready": ("Step 7 — Hardware Trigger Mode", [
             "Camera is now in HARDWARE TRIGGER mode.",
             "",
-            "Trigger source   :  Line1",
+            "Trigger source     :  Line1",
             "Trigger activation :  Rising Edge",
             "",
-            "Click Continue when ready to test the push button.",
+            "In the next step you will set how many trigger",
+            "pulses to capture, then press the push button",
+            "that number of times.",
+            "",
+            "Click Continue when ready.",
         ]),
     }
 
@@ -324,7 +349,7 @@ class ProceedDialog(QDialog):
         super().__init__(parent)
         title, lines = self.TITLES.get(gate_id, (f"Gate: {gate_id}", ["Press Continue."]))
         self.setWindowTitle(title)
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(440)
         self.setStyleSheet(DIALOG_STYLE)
 
         layout = QVBoxLayout(self)
@@ -333,9 +358,174 @@ class ProceedDialog(QDialog):
 
         layout.addWidget(make_label(title, 14, bold=True))
         for line in lines:
-            layout.addWidget(make_label(line, 11, color=CLR_TEXT_MUTED if not line.strip() else CLR_TEXT))
+            color = CLR_TEXT_MUTED if not line.strip() else CLR_TEXT
+            layout.addWidget(make_label(line, 11, color=color))
 
         btn = QPushButton("Continue  →")
         btn.setObjectName("accept_btn")
         btn.clicked.connect(self.accept)
         layout.addWidget(btn, alignment=Qt.AlignRight)
+
+
+# ------------------------------------------------------------------ #
+# TriggerCountDialog  (NEW in v3)                                     #
+# ------------------------------------------------------------------ #
+
+class TriggerCountDialog(QDialog):
+    """Step 8 — operator sets how many hardware trigger captures to collect.
+
+    Returns self.trigger_count (int) after accept().
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Step 8 — Set Number of Triggers")
+        self.setMinimumWidth(460)
+        self.setStyleSheet(DIALOG_STYLE)
+        self.trigger_count: int = 1
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(16)
+        layout.setContentsMargins(28, 24, 28, 20)
+
+        layout.addWidget(make_label("Hardware Trigger Capture", 15, bold=True))
+        layout.addWidget(make_label(
+            "How many trigger pulses do you want to capture?", 11, color=CLR_TEXT_MUTED
+        ))
+        layout.addWidget(make_label(
+            "Each time you press the push button, one image will be saved.", 11,
+            color=CLR_TEXT_MUTED
+        ))
+
+        # Divider
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setStyleSheet(f"color: {CLR_BORDER};")
+        layout.addWidget(line)
+
+        # Spin box — large and clear for operators
+        spin_row = QHBoxLayout()
+        spin_row.addWidget(make_label("Number of captures:", 13))
+        self._spin = QSpinBox()
+        self._spin.setRange(1, 100)
+        self._spin.setValue(1)
+        self._spin.setFixedWidth(120)
+        spin_row.addWidget(self._spin)
+        spin_row.addStretch()
+        layout.addLayout(spin_row)
+
+        layout.addWidget(make_label(
+            "After clicking Start, press the push button the required\n"
+            "number of times. A progress bar will track each capture.",
+            11, color=CLR_TEXT_MUTED
+        ))
+
+        btn_row = QHBoxLayout()
+        btn_cancel = QPushButton("Cancel")
+        btn_start  = QPushButton("Start  →")
+        btn_start.setObjectName("accept_btn")
+        btn_row.addWidget(btn_cancel)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_start)
+        layout.addLayout(btn_row)
+
+        btn_cancel.clicked.connect(self.reject)
+        btn_start.clicked.connect(self._start)
+
+    def _start(self):
+        self.trigger_count = self._spin.value()
+        self.accept()
+
+
+# ------------------------------------------------------------------ #
+# HwTriggerProgressDialog  (NEW in v3)                               #
+# ------------------------------------------------------------------ #
+
+class HwTriggerProgressDialog(QDialog):
+    """Step 8 — non-blocking progress dialog shown while captures arrive.
+
+    The workflow thread calls update_progress() after each capture.
+    The dialog closes itself when all captures are complete.
+    It is shown with show() (non-modal) so the main window can still
+    receive signals and update the camera feed.
+    """
+
+    # Emitted when operator clicks Abort inside this dialog
+    abort_requested = pyqtSignal()
+
+    def __init__(self, total: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Step 8 — Capturing Hardware Triggers")
+        self.setMinimumWidth(500)
+        self.setStyleSheet(DIALOG_STYLE)
+        # Prevent operator from closing via X button during capture
+        self.setWindowFlags(
+            Qt.Dialog | Qt.WindowTitleHint | Qt.CustomizeWindowHint
+        )
+
+        self._total    = total
+        self._captured = 0
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(16)
+        layout.setContentsMargins(28, 24, 28, 20)
+
+        layout.addWidget(
+            make_label(f"Capturing  0 / {total}  hardware trigger images", 14, bold=True)
+        )
+        self._title_lbl = layout.itemAt(0).widget()
+
+        layout.addWidget(make_label(
+            "Press the push button each time to trigger a capture.\n"
+            "Each press captures and saves one image automatically.",
+            11, color=CLR_TEXT_MUTED
+        ))
+
+        # Progress bar
+        self._bar = QProgressBar()
+        self._bar.setRange(0, total)
+        self._bar.setValue(0)
+        self._bar.setFormat(f"0 / {total} captured")
+        layout.addWidget(self._bar)
+
+        # Live thumbnail of last captured image
+        self._thumb = QLabel()
+        self._thumb.setAlignment(Qt.AlignCenter)
+        self._thumb.setFixedHeight(220)
+        self._thumb.setStyleSheet(
+            f"background: #0a0a14; border: 1px solid {CLR_BORDER}; border-radius: 6px;"
+        )
+        self._thumb.setText("Waiting for first trigger …")
+        layout.addWidget(self._thumb)
+
+        # Status label
+        self._status_lbl = make_label("Waiting for push button …", 11, color=CLR_TEXT_MUTED)
+        layout.addWidget(self._status_lbl)
+
+        self._btn_abort = QPushButton("Abort")
+        self._btn_abort.setObjectName("retake_btn")
+        self._btn_abort.clicked.connect(self._on_abort)
+        layout.addWidget(self._btn_abort, alignment=Qt.AlignRight)
+
+    def update_progress(self, captured_count: int, last_frame: np.ndarray) -> None:
+        """Called from MainWindow slot after each trigger image is received."""
+        self._captured = captured_count
+        self._bar.setValue(captured_count)
+        self._bar.setFormat(f"{captured_count} / {self._total} captured")
+        self._title_lbl.setText(
+            f"Capturing  {captured_count} / {self._total}  hardware trigger images"
+        )
+        self._status_lbl.setText(f"Image {captured_count} saved  ✓")
+
+        # Update thumbnail
+        if last_frame is not None:
+            pix = _frame_to_pixmap(last_frame, max_w=460, max_h=210)
+            self._thumb.setPixmap(pix)
+
+        if captured_count >= self._total:
+            self._status_lbl.setText(f"All {self._total} images captured  ✓  Finishing …")
+            self._btn_abort.setEnabled(False)
+
+    def _on_abort(self):
+        self.abort_requested.emit()
+        self.close()
