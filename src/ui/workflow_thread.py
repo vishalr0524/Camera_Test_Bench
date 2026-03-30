@@ -1,15 +1,20 @@
 """
-WorkflowThread — Camera Test Bench v3
-======================================
-Runs all 9 test steps in a QThread.  All communication to the UI is
+WorkflowThread — Camera Test Bench v3.1
+========================================
+Runs all 10 test steps in a QThread.  All communication to the UI is
 via Qt signals.  The camera/verifier/saver code is NEVER modified.
 
-v3 changes (step 8 only):
-  • New signal  request_trigger_count()  — asks UI for number of triggers
-  • New signal  hw_trigger_progress(int, int, np.ndarray)
-                  → (captured_so_far, total, last_frame)
-  • _step8_9 loops N times, saves each image, emits progress after each
-  • Step 9 emits hw_trigger_all_complete(list) — list of saved file paths
+Steps:
+  1  Serial validation
+  2  Live feed
+  3  Focus
+  4  Capture image
+  5  Confirm captured image
+  5b Exposure preview  ← NEW: view same image at low/medium/high exposure
+  6  Aperture check    ← CHANGED: constant exposure (medium) for all sub-steps
+  7  Hardware trigger enable
+  8  Multi-trigger capture
+  9  Test complete
 """
 
 import copy
@@ -47,18 +52,21 @@ class WorkflowThread(QThread):
     capture_ready            = pyqtSignal(np.ndarray, dict)
     aperture_ready           = pyqtSignal(str, int, float, np.ndarray)
     aperture_summary         = pyqtSignal(bool, dict, str)
-    hw_trigger_waiting       = pyqtSignal()
-    hw_trigger_captured      = pyqtSignal(np.ndarray)          # single image (legacy)
-    hw_trigger_progress      = pyqtSignal(int, int, np.ndarray) # captured, total, frame  (v3)
-    hw_trigger_all_complete  = pyqtSignal(list)                 # list of saved paths (v3)
-    error_occurred           = pyqtSignal(str)
-    finished_workflow        = pyqtSignal()
-    serial_scan_done         = pyqtSignal(list)
-    request_serial           = pyqtSignal(list)
-    request_confirm          = pyqtSignal(str)
-    request_aperture_confirm = pyqtSignal(str)
-    request_proceed          = pyqtSignal(str)
-    request_trigger_count    = pyqtSignal()                     # v3: ask UI for N
+    hw_trigger_waiting        = pyqtSignal()
+    hw_trigger_captured       = pyqtSignal(np.ndarray)
+    hw_trigger_progress       = pyqtSignal(int, int, np.ndarray)
+    hw_trigger_all_complete   = pyqtSignal(list)
+    error_occurred            = pyqtSignal(str)
+    finished_workflow         = pyqtSignal()
+    serial_scan_done          = pyqtSignal(list)
+    request_serial            = pyqtSignal(list)
+    request_confirm           = pyqtSignal(str)
+    request_aperture_confirm  = pyqtSignal(str)
+    request_proceed           = pyqtSignal(str)
+    request_trigger_count     = pyqtSignal()
+    # v3.1 — step 5b: three images of same captured frame at different exposures
+    # emits list of (label, exposure_us, image_ndarray) tuples as a plain list
+    exposure_preview_ready    = pyqtSignal(list)
 
     def __init__(self, config_path: str = "configs/system_config.json") -> None:
         super().__init__()
@@ -179,6 +187,8 @@ class WorkflowThread(QThread):
         self._step3_focus_object()
         self._check_abort()
         self._step4_5_capture_and_verify()
+        self._check_abort()
+        self._step5b_exposure_preview()
         self._check_abort()
         self._step6_aperture_check()
         self._check_abort()
@@ -301,25 +311,90 @@ class WorkflowThread(QThread):
             return
 
     # ------------------------------------------------------------------ #
+    # Step 5b — Exposure preview (no input, view only)                   #
+    # ------------------------------------------------------------------ #
+
+    def _step5b_exposure_preview(self) -> None:
+        """Capture the same scene three times at low/medium/high exposure.
+        No operator input is needed — images are shown and saved automatically.
+        The camera returns to medium exposure when done.
+        """
+        logger.info("=== STEP 5b: Exposure Preview ===")
+        self.step_changed.emit(5, "Exposure Preview")
+        self.status_update.emit("Capturing exposure preview images — please wait…")
+
+        aperture_exp_map = self.tb_cfg.get("aperture_exposures", {
+            "low": 3000, "medium": 10000, "high": 30000,
+        })
+
+        previews = []  # list of dicts: {label, exposure_us, image}
+
+        for label in ["low", "medium", "high"]:
+            exposure_us = int(aperture_exp_map.get(label, 10000))
+            self.camera.set_exposure(exposure_us)
+            time.sleep(0.4)   # let sensor settle at new exposure
+
+            # Grab a few frames to flush the pipeline, take the last one
+            frame = None
+            for _ in range(3):
+                frame = self.camera.grab_image()
+                time.sleep(0.05)
+            if frame is None:
+                frame = self.camera.grab_image()
+
+            if frame is not None:
+                previews.append({
+                    "label":       label,
+                    "exposure_us": exposure_us,
+                    "image":       frame,
+                })
+                self.saver.save_image(frame, f"step5b_exposure_{label}")
+                logger.info(f"Exposure preview saved: {label} @ {exposure_us} µs")
+
+        # Restore medium exposure before moving on
+        correct_exp = int(aperture_exp_map.get("medium", 10000))
+        self.camera.set_exposure(correct_exp)
+        time.sleep(0.3)
+
+        self.saver.record_step("step5b_exposure_preview", {
+            "passed": True,
+            "exposures": {p["label"]: p["exposure_us"] for p in previews},
+        })
+
+        # Send to UI — blocks until operator dismisses the dialog
+        self._wait_for_ui(self.exposure_preview_ready, previews)
+        logger.info("Step 5b complete")
+
+    # ------------------------------------------------------------------ #
     # Step 6                                                               #
     # ------------------------------------------------------------------ #
 
     def _step6_aperture_check(self) -> None:
+        """Aperture check — exposure is held CONSTANT at 'medium' value for
+        all three sub-steps so that intensity changes are caused solely by the
+        aperture ring position, giving a reliable HIGH > MEDIUM > LOW comparison.
+        """
         logger.info("=== STEP 6: Aperture Check ===")
         self.step_changed.emit(6, "Aperture Adjustment Check")
 
-        aperture_steps   = self.tb_cfg.get("aperture_steps",   ["low", "correct", "high"])
+        aperture_steps   = self.tb_cfg.get("aperture_steps", ["low", "medium", "high"])
         aperture_exp_map = self.tb_cfg.get("aperture_exposures", {
-            "low": 3000, "correct": 10000, "high": 30000,
+            "low": 3000, "medium": 10000, "high": 30000,
         })
+
+        # CONSTANT exposure for all sub-steps = "medium" value from config
+        constant_exposure_us = int(aperture_exp_map.get("medium", 10000))
+        self.camera.set_exposure(constant_exposure_us)
+        time.sleep(0.3)
+        logger.info(f"Aperture check: exposure locked at {constant_exposure_us} µs for all sub-steps")
+
         intensities: Dict[str, float] = {}
 
         for step_name in aperture_steps:
-            exposure_us = int(aperture_exp_map.get(step_name, 10000))
-            self.camera.set_exposure(exposure_us)
-            time.sleep(0.3)
+            # Exposure does NOT change between sub-steps
             self.status_update.emit(
-                f"Set aperture to {step_name.upper()} position, then press CAPTURE."
+                f"Set aperture to {step_name.upper()} position, then press CAPTURE.  "
+                f"(Exposure fixed at {constant_exposure_us} µs)"
             )
 
             while True:
@@ -340,8 +415,13 @@ class WorkflowThread(QThread):
                 mean_intensity = compute_mean_intensity(captured)
                 intensities[step_name] = mean_intensity
 
+                # Pass constant_exposure_us so the dialog shows the real value
                 reply = self._wait_for_ui(
-                    self.aperture_ready, step_name, exposure_us, mean_intensity, captured
+                    self.aperture_ready,
+                    step_name,
+                    constant_exposure_us,
+                    mean_intensity,
+                    captured,
                 )
                 if reply == "retake":
                     self.status_update.emit(f"Retaking {step_name} aperture step.")
@@ -351,7 +431,10 @@ class WorkflowThread(QThread):
 
         passed, message = verify_aperture_sequence(intensities, aperture_steps)
         self.saver.record_step("step6_aperture", {
-            "passed": passed, "intensities": intensities, "message": message,
+            "passed":            passed,
+            "intensities":       intensities,
+            "message":           message,
+            "constant_exposure": constant_exposure_us,
         })
         self._wait_for_ui(self.aperture_summary, passed, intensities, message)
         logger.info("Step 6 complete")

@@ -1,7 +1,6 @@
 """
-Modal dialogs for Camera Test Bench v3 UI.
+Modal dialogs for Camera Test Bench UI.
 
-New in v3:
   TriggerCountDialog  — step 8: operator enters how many hardware triggers to capture
   HwTriggerProgressDialog — step 8: live progress bar while captures arrive
 """
@@ -243,7 +242,9 @@ class CaptureConfirmDialog(QDialog):
 # ------------------------------------------------------------------ #
 
 class ApertureConfirmDialog(QDialog):
-    """Step 6 sub-step — show aperture capture with intensity reading."""
+    """Step 6 sub-step — show aperture capture with intensity reading.
+    Exposure is constant across all sub-steps (locked to 'medium' value).
+    """
 
     def __init__(self, step_name: str, idx: int, total: int,
                  exposure_us: int, mean_intensity: float,
@@ -270,7 +271,10 @@ class ApertureConfirmDialog(QDialog):
         info = QFrame()
         info.setStyleSheet(f"background: {CLR_PANEL}; border-radius: 6px; padding: 8px;")
         il = QHBoxLayout(info)
-        il.addWidget(make_label(f"Exposure: {exposure_us} µs", 11))
+        il.addWidget(make_label(
+            f"Exposure: {exposure_us} µs  (constant for all sub-steps)", 11,
+            color=CLR_TEXT_MUTED
+        ))
         il.addStretch()
         il.addWidget(make_label(f"Mean Intensity: {mean_intensity:.1f} / 255", 11))
         layout.addWidget(info)
@@ -294,30 +298,183 @@ class ApertureConfirmDialog(QDialog):
 # ------------------------------------------------------------------ #
 
 class ApertureSummaryDialog(QDialog):
-    """Step 6 end — show intensity trend pass/fail."""
+    """Step 6 end — show intensity trend pass/fail.
+    Exposure was constant for all sub-steps, so intensity differences
+    are caused solely by the aperture ring position.
+    PASS = HIGH > MEDIUM > LOW  (aperture ring working)
+    FAIL = flat or reversed      (aperture ring stuck or wrong direction)
+    """
 
     def __init__(self, passed: bool, intensities: dict, message: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Step 6 — Aperture Summary")
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(520)
         self.setStyleSheet(DIALOG_STYLE)
 
         layout = QVBoxLayout(self)
-        layout.setSpacing(14)
+        layout.setSpacing(10)
         layout.setContentsMargins(24, 24, 24, 20)
 
         verdict = "Aperture Trend  PASS  ✓" if passed else "Aperture Trend  FAIL  ✗"
         color   = CLR_SUCCESS if passed else CLR_PRIMARY
         layout.addWidget(make_label(verdict, 15, bold=True, color=color))
 
-        for step, val in intensities.items():
-            layout.addWidget(
-                make_label(f"  {step.upper():<10}  intensity = {val:.1f}", 12)
+        # Clear explanation for operator
+        if passed:
+            expl = (
+                "PASS — Intensity increased correctly:  LOW  <  MEDIUM  <  HIGH\n"
+                "The aperture ring is working as expected."
             )
+        else:
+            expl = (
+                "FAIL — Intensity did NOT increase from LOW to HIGH.\n"
+                "Possible causes:\n"
+                "  • Aperture ring is stuck or not rotating\n"
+                "  • Aperture was rotated in the wrong direction\n"
+                "  • Retake the test and ensure LOW = minimum opening, HIGH = maximum"
+            )
+        layout.addWidget(make_label(expl, 11, color=CLR_TEXT_MUTED))
 
-        layout.addWidget(make_label(message, 11, color=CLR_TEXT_MUTED))
+        # Note: exposure was constant
+        layout.addWidget(make_label(
+            "Note: Exposure was fixed constant for all three sub-steps.\n"
+            "Intensity differences are caused only by the aperture ring position.",
+            10, color=CLR_TEXT_MUTED
+        ))
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(f"color: {CLR_BORDER};")
+        layout.addWidget(sep)
+
+        # Intensity readings with colour coding and arrows showing expected direction
+        step_colors = {"low": CLR_PRIMARY, "medium": CLR_SUCCESS, "high": CLR_WARNING}
+        step_labels = list(intensities.keys())
+        for i, (step, val) in enumerate(intensities.items()):
+            row = QHBoxLayout()
+            badge = QLabel(step.upper())
+            badge.setFixedWidth(80)
+            badge.setAlignment(Qt.AlignCenter)
+            badge.setStyleSheet(
+                f"background: {step_colors.get(step, CLR_ACCENT)}; color: #fff;"
+                "font-weight: bold; font-size: 11px; border-radius: 4px; padding: 3px 6px;"
+            )
+            row.addWidget(badge)
+            row.addWidget(make_label(f"Mean Intensity  =  {val:.1f} / 255", 11))
+            # Show comparison arrow to next step
+            if i < len(step_labels) - 1:
+                next_val = intensities[step_labels[i + 1]]
+                arrow = "✓" if next_val > val else "flat or decreasing ✗"
+                arrow_color = CLR_SUCCESS if next_val > val else CLR_PRIMARY
+                row.addWidget(make_label(arrow, 10, color=arrow_color))
+            row.addStretch()
+            layout.addLayout(row)
 
         btn = QPushButton("Continue  →")
+        btn.setObjectName("accept_btn")
+        btn.clicked.connect(self.accept)
+        layout.addWidget(btn, alignment=Qt.AlignRight)
+
+
+# ------------------------------------------------------------------ #
+# ExposurePreviewDialog                               #
+# ------------------------------------------------------------------ #
+
+class ExposurePreviewDialog(QDialog):
+    """Step 5b — view-only dialog showing the same scene at three exposures.
+
+    No accept/retake — operator simply views the three images and clicks OK.
+    The images are already saved before this dialog opens.
+    """
+
+    def __init__(self, previews: list, parent=None):
+        """
+        Args:
+            previews: list of dicts with keys 'label', 'exposure_us', 'image'
+        """
+        super().__init__(parent)
+        self.setWindowTitle("Step 5b — Exposure Preview")
+        self.setMinimumWidth(860)
+        self.setStyleSheet(DIALOG_STYLE)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(14)
+        layout.setContentsMargins(20, 20, 20, 16)
+
+        layout.addWidget(make_label("Exposure Preview", 15, bold=True))
+        layout.addWidget(make_label(
+            "The same scene captured at three exposure settings from the configuration.\n"
+            "These images have been saved automatically — no action required.",
+            11, color=CLR_TEXT_MUTED
+        ))
+
+        # Three images side by side
+        img_row = QHBoxLayout()
+        img_row.setSpacing(12)
+
+        for preview in previews:
+            label_str  = preview.get("label", "").upper()
+            exp_us     = preview.get("exposure_us", 0)
+            frame      = preview.get("image")
+
+            col = QVBoxLayout()
+            col.setSpacing(6)
+
+            # Header badge
+            badge_color = {
+                "LOW":     CLR_PRIMARY,
+                "MEDIUM":  CLR_SUCCESS,
+                "HIGH":    CLR_WARNING,
+            }.get(label_str, CLR_ACCENT)
+
+            header = QLabel(f"{label_str}  —  {exp_us} µs")
+            header.setAlignment(Qt.AlignCenter)
+            header.setStyleSheet(
+                f"background: {badge_color}; color: #fff; font-weight: bold;"
+                f"font-size: 13px; border-radius: 6px; padding: 5px 10px;"
+            )
+            col.addWidget(header)
+
+            # Image thumbnail
+            img_lbl = QLabel()
+            img_lbl.setAlignment(Qt.AlignCenter)
+            img_lbl.setFixedSize(240, 180)
+            img_lbl.setStyleSheet(
+                f"background: #0a0a14; border: 1px solid {CLR_BORDER}; border-radius: 6px;"
+            )
+            if frame is not None:
+                img_lbl.setPixmap(_frame_to_pixmap(frame, max_w=236, max_h=176))
+            else:
+                img_lbl.setText("No image")
+            col.addWidget(img_lbl)
+
+            # Intensity reading
+            if frame is not None:
+                import cv2 as _cv2
+                import numpy as _np
+                gray = _cv2.cvtColor(frame, _cv2.COLOR_BGR2GRAY)
+                mean_val = float(_np.mean(gray))
+                col.addWidget(make_label(f"Intensity: {mean_val:.1f} / 255", 10,
+                                         color=CLR_TEXT_MUTED))
+
+            img_row.addLayout(col)
+
+        layout.addLayout(img_row)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(f"color: {CLR_BORDER};")
+        layout.addWidget(sep)
+
+        layout.addWidget(make_label(
+            "Images saved:  step5b_exposure_low.png  /  step5b_exposure_medium.png  "
+            "/  step5b_exposure_high.png",
+            10, color=CLR_TEXT_MUTED
+        ))
+
+        btn = QPushButton("OK — Continue to Aperture Check  →")
         btn.setObjectName("accept_btn")
         btn.clicked.connect(self.accept)
         layout.addWidget(btn, alignment=Qt.AlignRight)
@@ -368,7 +525,7 @@ class ProceedDialog(QDialog):
 
 
 # ------------------------------------------------------------------ #
-# TriggerCountDialog  (NEW in v3)                                     #
+# TriggerCountDialog                                      #
 # ------------------------------------------------------------------ #
 
 class TriggerCountDialog(QDialog):
@@ -438,7 +595,7 @@ class TriggerCountDialog(QDialog):
 
 
 # ------------------------------------------------------------------ #
-# HwTriggerProgressDialog  (NEW in v3)                               #
+# HwTriggerProgressDialog                              #
 # ------------------------------------------------------------------ #
 
 class HwTriggerProgressDialog(QDialog):

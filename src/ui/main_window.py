@@ -31,7 +31,7 @@ from PyQt5.QtWidgets import (
 
 from src.ui.workflow_thread import WorkflowThread
 from src.ui.widgets import (
-    CameraFeedWidget, StepProgressWidget, MetricsPanel,
+    CameraFeedWidget, StepProgressWidget,
     StatusBar, make_label,
     CLR_BG, CLR_PANEL, CLR_ACCENT, CLR_PRIMARY, CLR_SUCCESS,
     CLR_WARNING, CLR_TEXT, CLR_TEXT_MUTED, CLR_BORDER,
@@ -40,6 +40,7 @@ from src.ui.dialogs import (
     SerialInputDialog, CaptureConfirmDialog,
     ApertureConfirmDialog, ApertureSummaryDialog, ProceedDialog,
     TriggerCountDialog, HwTriggerProgressDialog,
+    ExposurePreviewDialog,
 )
 from src.utils import get_logger
 
@@ -94,7 +95,6 @@ class MainWindow(QMainWindow):
     def __init__(self, config_path: str = "configs/system_config.json") -> None:
         super().__init__()
         self.config_path = config_path
-        self._sharpness_threshold = 50.0
         self._current_step = 0
         self._waiting_for: str = ""
         self._last_frame: np.ndarray = None
@@ -113,7 +113,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def _build_ui(self) -> None:
-        self.setWindowTitle("Camera Test Bench  v3.0")
+        self.setWindowTitle("Camera Test Bench")
         self.setMinimumSize(1200, 720)
 
         central = QWidget()
@@ -131,7 +131,7 @@ class MainWindow(QMainWindow):
         tb_layout = QHBoxLayout(title_bar)
         tb_layout.setContentsMargins(18, 0, 18, 0)
         tb_layout.addWidget(make_label("Camera Test Bench", 16, bold=True))
-        tb_layout.addWidget(make_label("v3.0", 11, color=CLR_TEXT_MUTED))
+        tb_layout.addWidget(make_label("", 11, color=CLR_TEXT_MUTED))
         tb_layout.addStretch()
         self._step_title_lbl = make_label("", 13, color=CLR_PRIMARY)
         tb_layout.addWidget(self._step_title_lbl)
@@ -154,10 +154,6 @@ class MainWindow(QMainWindow):
 
         self._feed = CameraFeedWidget()
         left_layout.addWidget(self._feed)
-
-        self._metrics = MetricsPanel()
-        self._metrics.setFixedHeight(90)
-        left_layout.addWidget(self._metrics)
 
         splitter.addWidget(left)
 
@@ -240,6 +236,7 @@ class MainWindow(QMainWindow):
         self._thread.request_trigger_count.connect(self._on_request_trigger_count)
         self._thread.hw_trigger_progress.connect(self._on_hw_trigger_progress)
         self._thread.hw_trigger_all_complete.connect(self._on_hw_trigger_all_complete)
+        self._thread.exposure_preview_ready.connect(self._on_exposure_preview_ready)
 
         self._thread.start()
 
@@ -257,17 +254,21 @@ class MainWindow(QMainWindow):
         logger.info(f"UI: step {step} — {title}")
 
     def _instruction_for_step(self, step: int) -> str:
-        return {
+        instructions = {
             1: "Enter the camera serial number shown on the camera label.\n\nA dialog will appear automatically.",
             2: "The camera is live.\n\nVerify the feed looks correct, then press ENTER or click Proceed.",
             3: "Rotate the focus ring on the lens until the Sharpness score is stable and high.\n\nPress SPACE or click the button when focused.",
             4: "Press SPACE or click CAPTURE IMAGE to grab a single frame.\n\nThe backend will verify it automatically.",
-            5: "Review the captured image and its metrics.\n\nUse the dialog buttons to Accept or Retake.",
-            6: "Three sub-steps:\n  1. Set aperture to LOW\n  2. Set to CORRECT\n  3. Set to HIGH\n\nPress SPACE at each position to capture.",
+            5: "Review the captured image.\n\nClick Accept to continue or Retake to capture again.\n\nAfter confirming, three exposure preview images will be shown automatically.",
+            6: "Three sub-steps — LOW, MEDIUM, HIGH aperture.\n\nExposure is fixed constant for all three.\nPress SPACE at each position to capture.",
             7: "Camera is now in HARDWARE TRIGGER mode.\n\nRead the information dialog carefully, then click Continue.",
             8: "Press the physical push button wired to Line1 the required number of times.\n\nA progress dialog tracks each capture automatically.",
             9: "All hardware trigger images captured and saved.\n\nTest is complete  ✓",
-        }.get(step, "")
+        }
+        return instructions.get(
+            step,
+            "Exposure Preview — viewing three images at different exposures.\nNo action required. Click OK to continue."
+        )
 
     def _set_instruction(self, title: str, body: str) -> None:
         self._instruction_title.setText(title)
@@ -281,7 +282,24 @@ class MainWindow(QMainWindow):
     def _on_frame_ready(self, frame: np.ndarray) -> None:
         self._last_frame = frame
         self._feed.update_frame(frame)
-        self._metrics.update_metrics(frame, self._sharpness_threshold)
+
+    # ------------------------------------------------------------------ #
+    # Slot — step 5b exposure preview (view-only, no operator input)      #
+    # ------------------------------------------------------------------ #
+
+    @pyqtSlot(list)
+    def _on_exposure_preview_ready(self, previews: list) -> None:
+        """Show ExposurePreviewDialog with the three exposure images.
+        No input from operator — they view and click OK to continue.
+        The images are already saved before this signal fires.
+        """
+        self._btn_capture.setVisible(False)
+        self._btn_proceed.setVisible(False)
+        dlg = ExposurePreviewDialog(previews, parent=self)
+        dlg.exec_()
+        # Unblock the workflow thread regardless of how dialog was closed
+        self._thread.reply("proceed")
+        self.setFocus()
 
     # ------------------------------------------------------------------ #
     # Slots — serial                                                       #
@@ -367,7 +385,7 @@ class MainWindow(QMainWindow):
                            mean_intensity: float, frame: np.ndarray) -> None:
         self._btn_capture.setVisible(False)
         self._btn_proceed.setVisible(False)
-        steps = ["low", "correct", "high"]
+        steps = ["low", "medium", "high"]
         idx   = steps.index(step_name) + 1 if step_name in steps else 1
         dlg   = ApertureConfirmDialog(step_name, idx, 3, exposure_us,
                                       mean_intensity, frame, parent=self)

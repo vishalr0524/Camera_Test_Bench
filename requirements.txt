@@ -2,6 +2,7 @@
 # Install with: pip install -r requirements.txt
 
 # Core computer vision
+# opencv-python required for test_bench_app.py
 opencv-python-headless>=4.7.0
 
 # Basler camera SDK Python bindings
