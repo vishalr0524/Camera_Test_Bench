@@ -22,10 +22,10 @@
         "quit_key": 113,
         "capture_verify_threshold": 10,
         "sharpness_threshold": 50.0,
-        "aperture_steps": ["low", "correct", "high"],
+        "aperture_steps": ["low", "medium", "high"],
         "aperture_exposures": {
             "low": 3000,
-            "correct": 10000,
+            "medium": 10000,
             "high": 30000
         },
         "hardware_trigger_timeout": 30000,

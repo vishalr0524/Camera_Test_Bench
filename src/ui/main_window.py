@@ -1,17 +1,22 @@
 """
-MainWindow — Camera Test Bench v2 PyQt5 UI
+MainWindow — Camera Test Bench v3 PyQt5 UI
 ==========================================
 Wires WorkflowThread signals to the UI.
 The entire workflow logic is untouched — this file is pure display / input.
 
+v3 additions:
+  _on_request_trigger_count()  — shows TriggerCountDialog, replies with N
+  _on_hw_trigger_progress()    — updates HwTriggerProgressDialog live
+  _on_hw_trigger_all_complete()— closes progress dialog, shows success screen
+
 Keyboard routing rules
 -----------------------
-ALL buttons have Qt.NoFocus so they never receive keyboard events directly.
-Every key press is handled exclusively in keyPressEvent():
-  SPACE  → fires _on_capture()  only when capture button is visible + enabled
-  ENTER  → fires _on_proceed()  only when proceed button is visible + enabled
-  Any other key → ignored silently, never propagated to any widget
-The Abort button is mouse-only — no keyboard shortcut at all.
+ALL buttons have Qt.NoFocus — keyboard never reaches them directly.
+keyPressEvent is the single source of truth:
+  SPACE  → _on_capture()  only when capture button is visible + enabled
+  ENTER  → _on_proceed()  only when proceed button is visible + enabled
+  Any other key → silently consumed, nothing happens
+Abort button is mouse-only — no keyboard shortcut.
 """
 
 import sys
@@ -20,13 +25,13 @@ from PyQt5.QtCore import Qt, pyqtSlot
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QFrame, QSplitter, QApplication,
+    QPushButton, QLabel, QFrame, QSplitter,
     QMessageBox, QSizePolicy,
 )
 
 from src.ui.workflow_thread import WorkflowThread
 from src.ui.widgets import (
-    CameraFeedWidget, StepProgressWidget, MetricsPanel,
+    CameraFeedWidget, StepProgressWidget,
     StatusBar, make_label,
     CLR_BG, CLR_PANEL, CLR_ACCENT, CLR_PRIMARY, CLR_SUCCESS,
     CLR_WARNING, CLR_TEXT, CLR_TEXT_MUTED, CLR_BORDER,
@@ -34,6 +39,8 @@ from src.ui.widgets import (
 from src.ui.dialogs import (
     SerialInputDialog, CaptureConfirmDialog,
     ApertureConfirmDialog, ApertureSummaryDialog, ProceedDialog,
+    TriggerCountDialog, HwTriggerProgressDialog,
+    ExposurePreviewDialog,
 )
 from src.utils import get_logger
 
@@ -58,7 +65,7 @@ QPushButton {{
     font-size: 13px;
     min-width: 110px;
 }}
-QPushButton:hover   {{ background: {CLR_PRIMARY}; }}
+QPushButton:hover    {{ background: {CLR_PRIMARY}; }}
 QPushButton:disabled {{ background: #111122; color: {CLR_TEXT_MUTED}; }}
 QPushButton#capture_btn {{
     background: {CLR_PRIMARY};
@@ -83,32 +90,30 @@ QPushButton#abort_btn:hover {{ background: #5c2020; }}
 
 
 class MainWindow(QMainWindow):
-    """Top-level application window."""
+    """Top-level application window for Camera Test Bench v3."""
 
     def __init__(self, config_path: str = "configs/system_config.json") -> None:
         super().__init__()
         self.config_path = config_path
-        self._sharpness_threshold = 50.0
         self._current_step = 0
         self._waiting_for: str = ""
         self._last_frame: np.ndarray = None
 
+        # v3: holds the live progress dialog during step 8
+        self._trigger_progress_dlg: HwTriggerProgressDialog = None
+
         self._build_ui()
         self._build_thread()
         self.setStyleSheet(APP_STYLE)
-
-        # Give focus to the window itself on startup.
-        # No button must ever hold keyboard focus — all key routing
-        # is handled exclusively in keyPressEvent().
         self.setFocus()
-        logger.info("MainWindow ready")
+        logger.info("MainWindow v3 ready")
 
     # ------------------------------------------------------------------ #
     # UI construction                                                      #
     # ------------------------------------------------------------------ #
 
     def _build_ui(self) -> None:
-        self.setWindowTitle("Camera Test Bench  v2.0")
+        self.setWindowTitle("Camera Test Bench")
         self.setMinimumSize(1200, 720)
 
         central = QWidget()
@@ -126,7 +131,7 @@ class MainWindow(QMainWindow):
         tb_layout = QHBoxLayout(title_bar)
         tb_layout.setContentsMargins(18, 0, 18, 0)
         tb_layout.addWidget(make_label("Camera Test Bench", 16, bold=True))
-        tb_layout.addWidget(make_label("v2.0", 11, color=CLR_TEXT_MUTED))
+        tb_layout.addWidget(make_label("", 11, color=CLR_TEXT_MUTED))
         tb_layout.addStretch()
         self._step_title_lbl = make_label("", 13, color=CLR_PRIMARY)
         tb_layout.addWidget(self._step_title_lbl)
@@ -149,10 +154,6 @@ class MainWindow(QMainWindow):
 
         self._feed = CameraFeedWidget()
         left_layout.addWidget(self._feed)
-
-        self._metrics = MetricsPanel()
-        self._metrics.setFixedHeight(90)
-        left_layout.addWidget(self._metrics)
 
         splitter.addWidget(left)
 
@@ -178,31 +179,28 @@ class MainWindow(QMainWindow):
         ifr_layout.addStretch()
         right_layout.addWidget(self._instruction_frame, stretch=1)
 
-        # ---- CAPTURE button ----
-        # Qt.NoFocus: mouse-clickable only.
-        # Keyboard activation via SPACE is handled exclusively in keyPressEvent.
+        # CAPTURE button — keyboard handled in keyPressEvent
         self._btn_capture = QPushButton("CAPTURE  [SPACE]")
         self._btn_capture.setObjectName("capture_btn")
-        self._btn_capture.setFocusPolicy(Qt.NoFocus)   # ← prevents SPACE triggering this
+        self._btn_capture.setFocusPolicy(Qt.NoFocus)
         self._btn_capture.setEnabled(False)
         self._btn_capture.setVisible(False)
         self._btn_capture.clicked.connect(self._on_capture)
         right_layout.addWidget(self._btn_capture)
 
-        # ---- PROCEED button ----
+        # PROCEED button
         self._btn_proceed = QPushButton("Proceed  [ENTER]")
         self._btn_proceed.setObjectName("proceed_btn")
-        self._btn_proceed.setFocusPolicy(Qt.NoFocus)   # ← prevents ENTER triggering this
+        self._btn_proceed.setFocusPolicy(Qt.NoFocus)
         self._btn_proceed.setEnabled(False)
         self._btn_proceed.setVisible(False)
         self._btn_proceed.clicked.connect(self._on_proceed)
         right_layout.addWidget(self._btn_proceed)
 
-        # ---- ABORT button ----
-        # Mouse-only. No keyboard shortcut. NoFocus prevents any key from reaching it.
+        # ABORT button — mouse-only, no keyboard shortcut
         self._btn_abort = QPushButton("Abort Test")
         self._btn_abort.setObjectName("abort_btn")
-        self._btn_abort.setFocusPolicy(Qt.NoFocus)     # ← THE ROOT CAUSE FIX
+        self._btn_abort.setFocusPolicy(Qt.NoFocus)
         self._btn_abort.clicked.connect(self._on_abort)
         right_layout.addWidget(self._btn_abort)
 
@@ -220,6 +218,7 @@ class MainWindow(QMainWindow):
     def _build_thread(self) -> None:
         self._thread = WorkflowThread(config_path=self.config_path)
 
+        # Existing signals
         self._thread.step_changed.connect(self._on_step_changed)
         self._thread.status_update.connect(self._status.set_message)
         self._thread.frame_ready.connect(self._on_frame_ready)
@@ -233,6 +232,12 @@ class MainWindow(QMainWindow):
         self._thread.request_serial.connect(self._on_request_serial)
         self._thread.request_proceed.connect(self._on_request_proceed)
 
+        # v3 new signals
+        self._thread.request_trigger_count.connect(self._on_request_trigger_count)
+        self._thread.hw_trigger_progress.connect(self._on_hw_trigger_progress)
+        self._thread.hw_trigger_all_complete.connect(self._on_hw_trigger_all_complete)
+        self._thread.exposure_preview_ready.connect(self._on_exposure_preview_ready)
+
         self._thread.start()
 
     # ------------------------------------------------------------------ #
@@ -245,22 +250,25 @@ class MainWindow(QMainWindow):
         self._progress.set_step(step)
         self._step_title_lbl.setText(f"Step {step}/9  —  {title}")
         self._set_instruction(title, self._instruction_for_step(step))
-        # Restore focus to window on every step change
         self.setFocus()
         logger.info(f"UI: step {step} — {title}")
 
     def _instruction_for_step(self, step: int) -> str:
-        return {
+        instructions = {
             1: "Enter the camera serial number shown on the camera label.\n\nA dialog will appear automatically.",
-            2: "The camera is live.\n\nVerify the feed looks correct, then click Proceed or press ENTER.",
+            2: "The camera is live.\n\nVerify the feed looks correct, then press ENTER or click Proceed.",
             3: "Rotate the focus ring on the lens until the Sharpness score is stable and high.\n\nPress SPACE or click the button when focused.",
             4: "Press SPACE or click CAPTURE IMAGE to grab a single frame.\n\nThe backend will verify it automatically.",
-            5: "Review the captured image and its metrics.\n\nUse the dialog buttons to Accept or Retake.",
-            6: "Three sub-steps:\n  1. Set aperture to LOW\n  2. Set to CORRECT\n  3. Set to HIGH\n\nPress SPACE at each position to capture.",
-            7: "Camera is switching to HARDWARE TRIGGER mode.\n\nClick Proceed or press ENTER when ready.",
-            8: "Press the physical push button wired to Line1 on the camera I/O connector.",
-            9: "Hardware-triggered image captured successfully!\n\nTest is complete.",
-        }.get(step, "")
+            5: "Review the captured image.\n\nClick Accept to continue or Retake to capture again.\n\nAfter confirming, three exposure preview images will be shown automatically.",
+            6: "Three sub-steps — LOW, MEDIUM, HIGH aperture.\n\nExposure is fixed constant for all three.\nPress SPACE at each position to capture.",
+            7: "Camera is now in HARDWARE TRIGGER mode.\n\nRead the information dialog carefully, then click Continue.",
+            8: "Press the physical push button wired to Line1 the required number of times.\n\nA progress dialog tracks each capture automatically.",
+            9: "All hardware trigger images captured and saved.\n\nTest is complete  ✓",
+        }
+        return instructions.get(
+            step,
+            "Exposure Preview — viewing three images at different exposures.\nNo action required. Click OK to continue."
+        )
 
     def _set_instruction(self, title: str, body: str) -> None:
         self._instruction_title.setText(title)
@@ -274,7 +282,24 @@ class MainWindow(QMainWindow):
     def _on_frame_ready(self, frame: np.ndarray) -> None:
         self._last_frame = frame
         self._feed.update_frame(frame)
-        self._metrics.update_metrics(frame, self._sharpness_threshold)
+
+    # ------------------------------------------------------------------ #
+    # Slot — step 5b exposure preview (view-only, no operator input)      #
+    # ------------------------------------------------------------------ #
+
+    @pyqtSlot(list)
+    def _on_exposure_preview_ready(self, previews: list) -> None:
+        """Show ExposurePreviewDialog with the three exposure images.
+        No input from operator — they view and click OK to continue.
+        The images are already saved before this signal fires.
+        """
+        self._btn_capture.setVisible(False)
+        self._btn_proceed.setVisible(False)
+        dlg = ExposurePreviewDialog(previews, parent=self)
+        dlg.exec_()
+        # Unblock the workflow thread regardless of how dialog was closed
+        self._thread.reply("proceed")
+        self.setFocus()
 
     # ------------------------------------------------------------------ #
     # Slots — serial                                                       #
@@ -297,11 +322,9 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str)
     def _on_request_proceed(self, gate_id: str) -> None:
-        """Show/hide and relabel buttons based on which gate is active.
-        Only one button is ever visible at a time."""
+        """Show/hide and relabel buttons based on which gate is active."""
         self._waiting_for = gate_id
 
-        # Step 7 — modal dialog only, no persistent button shown
         if gate_id == "hw_trigger_ready":
             dlg = ProceedDialog(gate_id, parent=self)
             dlg.exec_()
@@ -309,7 +332,6 @@ class MainWindow(QMainWindow):
             self.setFocus()
             return
 
-        # Hide both first — only the correct one will be shown below
         self._btn_capture.setVisible(False)
         self._btn_capture.setEnabled(False)
         self._btn_proceed.setVisible(False)
@@ -336,7 +358,6 @@ class MainWindow(QMainWindow):
             self._btn_capture.setVisible(True)
             self._btn_capture.setEnabled(True)
 
-        # Always return focus to window — never to a button
         self.setFocus()
 
     # ------------------------------------------------------------------ #
@@ -364,7 +385,7 @@ class MainWindow(QMainWindow):
                            mean_intensity: float, frame: np.ndarray) -> None:
         self._btn_capture.setVisible(False)
         self._btn_proceed.setVisible(False)
-        steps = ["low", "correct", "high"]
+        steps = ["low", "medium", "high"]
         idx   = steps.index(step_name) + 1 if step_name in steps else 1
         dlg   = ApertureConfirmDialog(step_name, idx, 3, exposure_us,
                                       mean_intensity, frame, parent=self)
@@ -382,7 +403,7 @@ class MainWindow(QMainWindow):
         self.setFocus()
 
     # ------------------------------------------------------------------ #
-    # Slots — hardware trigger                                             #
+    # Slots — hardware trigger (legacy single-image, kept for compatibility)
     # ------------------------------------------------------------------ #
 
     @pyqtSlot()
@@ -390,36 +411,104 @@ class MainWindow(QMainWindow):
         self._btn_capture.setVisible(False)
         self._btn_proceed.setVisible(False)
         self._set_instruction(
-            "Waiting for Hardware Trigger",
+            "Waiting for Hardware Triggers",
             "Press the physical push button wired to Line1.\n\n"
-            "The camera will capture automatically when it receives the signal.\n\n"
-            "Timeout: 30 seconds (auto-resets)."
+            "Each press captures and saves one image.\n\n"
+            "A progress dialog tracks how many have been captured."
         )
-        self._status.set_message("Waiting for push button signal on Line1 …")
+        self._status.set_message("Waiting for hardware trigger pulses on Line1 …")
         self.setFocus()
 
     @pyqtSlot(np.ndarray)
     def _on_hw_trigger_captured(self, frame: np.ndarray) -> None:
+        """Legacy single-image signal — not used in v3 multi-trigger flow."""
+        pass
+
+    # ------------------------------------------------------------------ #
+    # Slots — v3 trigger count dialog (step 8)                            #
+    # ------------------------------------------------------------------ #
+
+    @pyqtSlot()
+    def _on_request_trigger_count(self) -> None:
+        """Show TriggerCountDialog, reply with the chosen count (or abort)."""
+        self._btn_capture.setVisible(False)
+        self._btn_proceed.setVisible(False)
+
+        dlg = TriggerCountDialog(parent=self)
+        if dlg.exec_() == TriggerCountDialog.Accepted:
+            count = dlg.trigger_count
+            logger.info(f"Operator set trigger count: {count}")
+            self._thread.reply(str(count))
+
+            # Open the progress dialog immediately (non-modal)
+            self._trigger_progress_dlg = HwTriggerProgressDialog(
+                total=count, parent=self
+            )
+            self._trigger_progress_dlg.abort_requested.connect(self._on_trigger_abort)
+            self._trigger_progress_dlg.show()
+        else:
+            # Operator cancelled — abort the workflow
+            self._thread.reply("abort")
+
+        self.setFocus()
+
+    # ------------------------------------------------------------------ #
+    # Slots — v3 per-image progress                                       #
+    # ------------------------------------------------------------------ #
+
+    @pyqtSlot(int, int, np.ndarray)
+    def _on_hw_trigger_progress(self, captured: int, total: int,
+                                 frame: np.ndarray) -> None:
+        """Called after each trigger image is captured — update progress dialog."""
         self._feed.update_frame(frame)
+
+        if self._trigger_progress_dlg is not None:
+            self._trigger_progress_dlg.update_progress(captured, frame)
+
+        self._status.set_message(f"Hardware trigger: {captured} / {total} captured  ✓")
+
+    # ------------------------------------------------------------------ #
+    # Slots — v3 all captures complete                                    #
+    # ------------------------------------------------------------------ #
+
+    @pyqtSlot(list)
+    def _on_hw_trigger_all_complete(self, saved_paths: list) -> None:
+        """All N trigger images captured — close progress dialog, show summary."""
+        # Close the progress dialog
+        if self._trigger_progress_dlg is not None:
+            self._trigger_progress_dlg.close()
+            self._trigger_progress_dlg = None
+
+        count = len(saved_paths)
         self._set_instruction(
-            "Hardware Trigger — Success  ✓",
-            "The push button signal was received and the image was captured.\n\n"
-            "All steps complete. You may close the application."
+            "Test Complete  ✓",
+            f"All {count} hardware trigger image(s) captured and saved.\n\n"
+            f"Images are in the results/ folder with timestamps.\n\n"
+            "You may close the application."
         )
-        self._status.set_message("Hardware trigger image captured  ✓  — Test complete.")
+        self._status.set_message(
+            f"Test complete — {count} image(s) saved to results/  ✓"
+        )
+
         QMessageBox.information(
-            self, "Test Complete",
-            "All 9 steps passed.\n\nResults saved to the results/ folder."
+            self,
+            "Test Complete",
+            f"All 9 steps passed.\n\n"
+            f"{count} hardware trigger image(s) saved to the results/ folder.",
         )
         self.setFocus()
+
+    def _on_trigger_abort(self) -> None:
+        """Operator pressed Abort inside the progress dialog."""
+        self._thread.abort()
+        self._trigger_progress_dlg = None
+        self._status.set_message("Hardware trigger capture aborted.")
 
     # ------------------------------------------------------------------ #
     # Button click handlers                                                #
     # ------------------------------------------------------------------ #
 
     def _on_capture(self) -> None:
-        """Called by mouse click OR SPACE in keyPressEvent.
-        Guard check ensures it only fires when the button is actually active."""
         if not self._btn_capture.isVisible() or not self._btn_capture.isEnabled():
             return
         self._btn_capture.setEnabled(False)
@@ -428,7 +517,6 @@ class MainWindow(QMainWindow):
         self.setFocus()
 
     def _on_proceed(self) -> None:
-        """Called by mouse click OR ENTER in keyPressEvent."""
         if not self._btn_proceed.isVisible() or not self._btn_proceed.isEnabled():
             return
         self._btn_proceed.setEnabled(False)
@@ -437,16 +525,17 @@ class MainWindow(QMainWindow):
         self.setFocus()
 
     def _on_abort(self) -> None:
-        """Mouse-only. No keyboard shortcut. Always confirms with Yes/No, default No."""
         reply = QMessageBox.question(
             self,
             "Abort Test",
-            "Are you sure you want to abort the current test?\n\n"
-            "All progress will be lost.",
+            "Are you sure you want to abort the current test?\n\nAll progress will be lost.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
+            if self._trigger_progress_dlg is not None:
+                self._trigger_progress_dlg.close()
+                self._trigger_progress_dlg = None
             self._thread.abort()
             self._btn_capture.setVisible(False)
             self._btn_proceed.setVisible(False)
@@ -460,6 +549,9 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str)
     def _on_error(self, message: str) -> None:
         logger.error(f"Workflow error: {message}")
+        if self._trigger_progress_dlg is not None:
+            self._trigger_progress_dlg.close()
+            self._trigger_progress_dlg = None
         QMessageBox.critical(self, "Workflow Error", f"An error occurred:\n\n{message}")
         self._status.set_message(f"Error: {message}")
         self.setFocus()
@@ -471,50 +563,42 @@ class MainWindow(QMainWindow):
         logger.info("Workflow finished")
 
     # ------------------------------------------------------------------ #
-    # Keyboard handler — ONLY place where keys are acted on               #
+    # Keyboard handler                                                     #
     # ------------------------------------------------------------------ #
 
     def keyPressEvent(self, event) -> None:
         """
-        Single source of truth for all keyboard input.
-
-        SPACE  → _on_capture(), but ONLY if capture button is visible+enabled.
-        ENTER  → _on_proceed(), but ONLY if proceed button is visible+enabled.
-        Anything else → silently consumed, nothing happens.
-
-        super() is intentionally NOT called — this prevents Qt from
-        routing any key to any button or child widget.
+        Single source of truth for keyboard input.
+        SPACE  → capture (only if button visible + enabled)
+        ENTER  → proceed (only if button visible + enabled)
+        All other keys → silently consumed, nothing happens.
+        super() intentionally NOT called.
         """
         key = event.key()
 
         if key == Qt.Key_Space:
             if self._btn_capture.isVisible() and self._btn_capture.isEnabled():
                 self._on_capture()
-            # else: SPACE is pressed but capture is not active → do nothing
-            return   # never propagate SPACE to any widget
+            return   # consume SPACE regardless
 
         if key in (Qt.Key_Return, Qt.Key_Enter):
             if self._btn_proceed.isVisible() and self._btn_proceed.isEnabled():
                 self._on_proceed()
-            # else: ENTER is pressed but proceed is not active → do nothing
-            return   # never propagate ENTER to any widget
+            return   # consume ENTER regardless
 
-        # All other keys: swallow silently.
-        # No super() call = no widget receives this key.
+        # All other keys — swallow silently, no super() call
 
     # ------------------------------------------------------------------ #
-    # Close — always confirm with Yes/No                                   #
+    # Close                                                                #
     # ------------------------------------------------------------------ #
 
     def closeEvent(self, event) -> None:
-        """Intercept the window X button — confirm before closing."""
         if self._thread.isRunning():
             reply = QMessageBox.question(
                 self,
                 "Quit Camera Test Bench",
                 "A test is currently in progress.\n\n"
-                "Are you sure you want to quit?\n"
-                "All progress will be lost.",
+                "Are you sure you want to quit?\nAll progress will be lost.",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
@@ -522,6 +606,8 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 self.setFocus()
                 return
+            if self._trigger_progress_dlg is not None:
+                self._trigger_progress_dlg.close()
             self._thread.abort()
             self._thread.wait(3000)
         event.accept()
