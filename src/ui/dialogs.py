@@ -1,18 +1,20 @@
 """
-Modal dialogs for Camera Test Bench UI.
+Modal dialogs for Camera Test Bench v3.
 
-  TriggerCountDialog  — step 8: operator enters how many hardware triggers to capture
-  HwTriggerProgressDialog — step 8: live progress bar while captures arrive
+Changes in this version:
+  Change 4: SerialInputDialog  — Exit Application button between Re-scan and Confirm
+  Change 6: CaptureConfirmDialog — "CAPTURE NOT OK — Image is Black" banner when
+             mean_intensity < 5 (completely black image)
 """
 
 import cv2
 import numpy as np
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QImage, QPixmap, QFont
+from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QListWidget, QListWidgetItem,
-    QFrame, QProgressBar, QSpinBox,
+    QFrame, QProgressBar, QSpinBox, QApplication,
 )
 
 from src.ui.widgets import (
@@ -49,6 +51,14 @@ DIALOG_STYLE = f"""
         background: {CLR_WARNING};
         color: #000;
         font-weight: bold;
+    }}
+    QPushButton#exit_btn {{
+        background: #2c1010;
+        color: #e74c3c;
+        border: 1px solid #5c2020;
+    }}
+    QPushButton#exit_btn:hover {{
+        background: #5c2020;
     }}
     QLineEdit {{
         background: {CLR_ACCENT};
@@ -92,6 +102,9 @@ DIALOG_STYLE = f"""
     }}
 """
 
+# Constant threshold for "completely black image" detection
+_BLACK_INTENSITY_THRESHOLD = 5.0
+
 
 def _frame_to_pixmap(frame: np.ndarray, max_w: int = 560, max_h: int = 380) -> QPixmap:
     rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -101,37 +114,54 @@ def _frame_to_pixmap(frame: np.ndarray, max_w: int = 560, max_h: int = 380) -> Q
     return pix.scaled(max_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
 
+def _mean_intensity(frame: np.ndarray) -> float:
+    """Compute mean pixel brightness of a BGR frame (0–255)."""
+    if frame is None or frame.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return float(np.mean(gray))
+
+
 # ------------------------------------------------------------------ #
 # SerialInputDialog                                                   #
+# Change 4: Exit Application button added between Re-scan and Confirm #
 # ------------------------------------------------------------------ #
 
 class SerialInputDialog(QDialog):
-    """Step 1 — ask operator to enter / select a camera serial number."""
+    """Step 1 — ask operator to enter / select a camera serial number.
+
+    Button layout (left → right):
+      [Re-scan USB]   [Exit Application]   [Confirm ✓]
+    """
+
+    # Special result code so the caller can tell "exit" from "rescan"
+    EXIT_CODE = 2
 
     def __init__(self, available: list, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Step 1 — Serial Number Validation")
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(520)
         self.setStyleSheet(DIALOG_STYLE)
         self.serial = ""
+        self._exit_requested = False
 
         layout = QVBoxLayout(self)
         layout.setSpacing(14)
         layout.setContentsMargins(24, 24, 24, 20)
 
         layout.addWidget(make_label("Camera Serial Number Validation", 15, bold=True))
-        layout.addWidget(make_label("Detected cameras on this system:", 11,
-                                    color=CLR_TEXT_MUTED))
+        layout.addWidget(make_label(
+            "Detected cameras on this system:", 11, color=CLR_TEXT_MUTED
+        ))
 
         self._list = QListWidget()
         self._list.setFixedHeight(100)
         if available:
             for sn in available:
-                item = QListWidgetItem(f"  {sn}")
-                self._list.addItem(item)
+                self._list.addItem(QListWidgetItem(f"  {sn}"))
             self._list.setCurrentRow(0)
         else:
-            self._list.addItem("  No cameras detected — check USB connection")
+            self._list.addItem("  No cameras detected — check USB / Ethernet connection")
         layout.addWidget(self._list)
 
         layout.addWidget(make_label("Enter serial number:", 11))
@@ -145,17 +175,24 @@ class SerialInputDialog(QDialog):
             lambda t: self._edit.setText(t.strip())
         )
 
+        # ---- Button row: Re-scan | Exit | Confirm ----
         btn_row = QHBoxLayout()
-        self._btn_rescan  = QPushButton("Re-scan USB")
+
+        self._btn_rescan = QPushButton("Re-scan USB / GigE")
+        self._btn_exit   = QPushButton("Exit Application")
+        self._btn_exit.setObjectName("exit_btn")
         self._btn_confirm = QPushButton("Confirm  ✓")
         self._btn_confirm.setObjectName("accept_btn")
+
         btn_row.addWidget(self._btn_rescan)
+        btn_row.addWidget(self._btn_exit)
         btn_row.addStretch()
         btn_row.addWidget(self._btn_confirm)
         layout.addLayout(btn_row)
 
         self._btn_confirm.clicked.connect(self._confirm)
-        self._btn_rescan.clicked.connect(self.reject)
+        self._btn_rescan.clicked.connect(self.reject)          # reject = rescan
+        self._btn_exit.clicked.connect(self._exit_app)
         self._edit.returnPressed.connect(self._confirm)
 
         if not available:
@@ -165,13 +202,30 @@ class SerialInputDialog(QDialog):
         self.serial = self._edit.text().strip()
         self.accept()
 
+    def _exit_app(self):
+        """Operator wants to quit the whole application from step 1."""
+        self._exit_requested = True
+        self.done(self.EXIT_CODE)
+
+    @property
+    def exit_requested(self) -> bool:
+        return self._exit_requested
+
 
 # ------------------------------------------------------------------ #
 # CaptureConfirmDialog                                                #
+# Change 6: "CAPTURE NOT OK — Image is Black" when intensity < 5    #
 # ------------------------------------------------------------------ #
 
 class CaptureConfirmDialog(QDialog):
-    """Step 5 — show captured image with metrics, accept or retake."""
+    """Step 5 — show captured image with metrics, accept or retake.
+
+    Verdict banner logic:
+      mean_intensity < 5   → "CAPTURE NOT OK — Image is Completely Black"  (red)
+      "error" in details   → "CAPTURE FAILED"                               (red)
+      "warning" in details → "CAPTURE — Review Required"                    (amber)
+      otherwise            → "CAPTURE OK  ✓"                                (green)
+    """
 
     def __init__(self, frame: np.ndarray, details: dict, parent=None):
         super().__init__(parent)
@@ -184,16 +238,42 @@ class CaptureConfirmDialog(QDialog):
         layout.setSpacing(12)
         layout.setContentsMargins(20, 20, 20, 16)
 
-        passed = "warning" not in details and "error" not in details
-        verdict = "CAPTURE OK  ✓" if passed else "CAPTURE — Review Required"
-        v_color = CLR_SUCCESS if passed else CLR_WARNING
+        # ---- Determine verdict ----
+        intensity = _mean_intensity(frame)
+        is_black  = intensity < _BLACK_INTENSITY_THRESHOLD
+        has_error = "error" in details
+        has_warn  = "warning" in details
+
+        if is_black:
+            verdict  = "CAPTURE NOT OK  ✗  —  Image is Completely Black"
+            v_color  = CLR_PRIMARY      # red
+        elif has_error:
+            verdict  = "CAPTURE FAILED  ✗"
+            v_color  = CLR_PRIMARY
+        elif has_warn:
+            verdict  = "CAPTURE — Review Required  ⚠"
+            v_color  = CLR_WARNING
+        else:
+            verdict  = "CAPTURE OK  ✓"
+            v_color  = CLR_SUCCESS
+
         layout.addWidget(make_label(verdict, 15, bold=True, color=v_color))
 
+        # Extra guidance for black image
+        if is_black:
+            layout.addWidget(make_label(
+                "The captured image is completely black (mean intensity < 5).\n"
+                "Possible causes: lens cap on, exposure too low, camera not pointed at scene.",
+                11, color=CLR_TEXT_MUTED
+            ))
+
+        # ---- Image preview ----
         img_lbl = QLabel()
         img_lbl.setAlignment(Qt.AlignCenter)
         img_lbl.setPixmap(_frame_to_pixmap(frame))
         layout.addWidget(img_lbl)
 
+        # ---- Metrics ----
         metrics_frame = QFrame()
         metrics_frame.setStyleSheet(
             f"background: {CLR_PANEL}; border-radius: 6px; padding: 8px;"
@@ -204,7 +284,8 @@ class CaptureConfirmDialog(QDialog):
         rows = [
             ("Resolution",  details.get("resolution",     "—")),
             ("Sharpness",   str(details.get("sharpness",  "—"))),
-            ("Intensity",   str(details.get("mean_intensity", "—"))),
+            ("Intensity",   f"{intensity:.1f} / 255"
+                            + ("  ← COMPLETELY BLACK" if is_black else "")),
         ]
         if "warning" in details:
             rows.append(("Warning", details["warning"]))
@@ -214,11 +295,15 @@ class CaptureConfirmDialog(QDialog):
         for k, v in rows:
             row = QHBoxLayout()
             row.addWidget(make_label(f"{k}:", 11, color=CLR_TEXT_MUTED))
-            row.addWidget(make_label(v, 11))
+            lbl = make_label(v, 11)
+            if k == "Intensity" and is_black:
+                lbl.setStyleSheet(f"color: {CLR_PRIMARY}; font-weight: bold; background: transparent;")
+            row.addWidget(lbl)
             row.addStretch()
             mf_layout.addLayout(row)
         layout.addWidget(metrics_frame)
 
+        # ---- Buttons ----
         btn_row = QHBoxLayout()
         self._btn_retake = QPushButton("Retake  ↩")
         self._btn_retake.setObjectName("retake_btn")
@@ -242,9 +327,7 @@ class CaptureConfirmDialog(QDialog):
 # ------------------------------------------------------------------ #
 
 class ApertureConfirmDialog(QDialog):
-    """Step 6 sub-step — show aperture capture with intensity reading.
-    Exposure is constant across all sub-steps (locked to 'medium' value).
-    """
+    """Step 6 sub-step — show aperture capture with intensity reading."""
 
     def __init__(self, step_name: str, idx: int, total: int,
                  exposure_us: int, mean_intensity: float,
@@ -302,7 +385,7 @@ class ApertureSummaryDialog(QDialog):
     Exposure was constant for all sub-steps, so intensity differences
     are caused solely by the aperture ring position.
     PASS = HIGH > MEDIUM > LOW  (aperture ring working)
-    FAIL = flat or reversed      (aperture ring stuck or wrong direction)
+    FAIL = flat or reversed     (aperture ring stuck or wrong direction)
     """
 
     def __init__(self, passed: bool, intensities: dict, message: str, parent=None):
@@ -319,7 +402,6 @@ class ApertureSummaryDialog(QDialog):
         color   = CLR_SUCCESS if passed else CLR_PRIMARY
         layout.addWidget(make_label(verdict, 15, bold=True, color=color))
 
-        # Clear explanation for operator
         if passed:
             expl = (
                 "PASS — Intensity increased correctly:  LOW  <  MEDIUM  <  HIGH\n"
@@ -335,20 +417,17 @@ class ApertureSummaryDialog(QDialog):
             )
         layout.addWidget(make_label(expl, 11, color=CLR_TEXT_MUTED))
 
-        # Note: exposure was constant
         layout.addWidget(make_label(
             "Note: Exposure was fixed constant for all three sub-steps.\n"
             "Intensity differences are caused only by the aperture ring position.",
             10, color=CLR_TEXT_MUTED
         ))
 
-        # Separator
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
         sep.setStyleSheet(f"color: {CLR_BORDER};")
         layout.addWidget(sep)
 
-        # Intensity readings with colour coding and arrows showing expected direction
         step_colors = {"low": CLR_PRIMARY, "medium": CLR_SUCCESS, "high": CLR_WARNING}
         step_labels = list(intensities.keys())
         for i, (step, val) in enumerate(intensities.items()):
@@ -362,10 +441,9 @@ class ApertureSummaryDialog(QDialog):
             )
             row.addWidget(badge)
             row.addWidget(make_label(f"Mean Intensity  =  {val:.1f} / 255", 11))
-            # Show comparison arrow to next step
             if i < len(step_labels) - 1:
                 next_val = intensities[step_labels[i + 1]]
-                arrow = "✓" if next_val > val else "flat or decreasing ✗"
+                arrow = "↑ increasing  ✓" if next_val > val else "→ flat or ↓ decreasing  ✗"
                 arrow_color = CLR_SUCCESS if next_val > val else CLR_PRIMARY
                 row.addWidget(make_label(arrow, 10, color=arrow_color))
             row.addStretch()
@@ -378,21 +456,13 @@ class ApertureSummaryDialog(QDialog):
 
 
 # ------------------------------------------------------------------ #
-# ExposurePreviewDialog                               #
+# ExposurePreviewDialog                                               #
 # ------------------------------------------------------------------ #
 
 class ExposurePreviewDialog(QDialog):
-    """Step 5b — view-only dialog showing the same scene at three exposures.
-
-    No accept/retake — operator simply views the three images and clicks OK.
-    The images are already saved before this dialog opens.
-    """
+    """Step 5b — view-only dialog showing the same scene at three exposures."""
 
     def __init__(self, previews: list, parent=None):
-        """
-        Args:
-            previews: list of dicts with keys 'label', 'exposure_us', 'image'
-        """
         super().__init__(parent)
         self.setWindowTitle("Step 5b — Exposure Preview")
         self.setMinimumWidth(860)
@@ -409,23 +479,21 @@ class ExposurePreviewDialog(QDialog):
             11, color=CLR_TEXT_MUTED
         ))
 
-        # Three images side by side
         img_row = QHBoxLayout()
         img_row.setSpacing(12)
 
         for preview in previews:
-            label_str  = preview.get("label", "").upper()
-            exp_us     = preview.get("exposure_us", 0)
-            frame      = preview.get("image")
+            label_str = preview.get("label", "").upper()
+            exp_us    = preview.get("exposure_us", 0)
+            frame     = preview.get("image")
 
             col = QVBoxLayout()
             col.setSpacing(6)
 
-            # Header badge
             badge_color = {
-                "LOW":     CLR_PRIMARY,
-                "MEDIUM":  CLR_SUCCESS,
-                "HIGH":    CLR_WARNING,
+                "LOW":    CLR_PRIMARY,
+                "MEDIUM": CLR_SUCCESS,
+                "HIGH":   CLR_WARNING,
             }.get(label_str, CLR_ACCENT)
 
             header = QLabel(f"{label_str}  —  {exp_us} µs")
@@ -436,7 +504,6 @@ class ExposurePreviewDialog(QDialog):
             )
             col.addWidget(header)
 
-            # Image thumbnail
             img_lbl = QLabel()
             img_lbl.setAlignment(Qt.AlignCenter)
             img_lbl.setFixedSize(240, 180)
@@ -449,20 +516,14 @@ class ExposurePreviewDialog(QDialog):
                 img_lbl.setText("No image")
             col.addWidget(img_lbl)
 
-            # Intensity reading
             if frame is not None:
-                import cv2 as _cv2
-                import numpy as _np
-                gray = _cv2.cvtColor(frame, _cv2.COLOR_BGR2GRAY)
-                mean_val = float(_np.mean(gray))
+                mean_val = _mean_intensity(frame)
                 col.addWidget(make_label(f"Intensity: {mean_val:.1f} / 255", 10,
                                          color=CLR_TEXT_MUTED))
-
             img_row.addLayout(col)
 
         layout.addLayout(img_row)
 
-        # Separator
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
         sep.setStyleSheet(f"color: {CLR_BORDER};")
@@ -525,14 +586,11 @@ class ProceedDialog(QDialog):
 
 
 # ------------------------------------------------------------------ #
-# TriggerCountDialog                                      #
+# TriggerCountDialog                                                  #
 # ------------------------------------------------------------------ #
 
 class TriggerCountDialog(QDialog):
-    """Step 8 — operator sets how many hardware trigger captures to collect.
-
-    Returns self.trigger_count (int) after accept().
-    """
+    """Step 8 — operator sets how many hardware trigger captures to collect."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -554,13 +612,11 @@ class TriggerCountDialog(QDialog):
             color=CLR_TEXT_MUTED
         ))
 
-        # Divider
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
         line.setStyleSheet(f"color: {CLR_BORDER};")
         layout.addWidget(line)
 
-        # Spin box — large and clear for operators
         spin_row = QHBoxLayout()
         spin_row.addWidget(make_label("Number of captures:", 13))
         self._spin = QSpinBox()
@@ -595,19 +651,12 @@ class TriggerCountDialog(QDialog):
 
 
 # ------------------------------------------------------------------ #
-# HwTriggerProgressDialog                              #
+# HwTriggerProgressDialog                                             #
 # ------------------------------------------------------------------ #
 
 class HwTriggerProgressDialog(QDialog):
-    """Step 8 — non-blocking progress dialog shown while captures arrive.
+    """Step 8 — non-blocking progress dialog shown while captures arrive."""
 
-    The workflow thread calls update_progress() after each capture.
-    The dialog closes itself when all captures are complete.
-    It is shown with show() (non-modal) so the main window can still
-    receive signals and update the camera feed.
-    """
-
-    # Emitted when operator clicks Abort inside this dialog
     abort_requested = pyqtSignal()
 
     def __init__(self, total: int, parent=None):
@@ -615,7 +664,6 @@ class HwTriggerProgressDialog(QDialog):
         self.setWindowTitle("Step 8 — Capturing Hardware Triggers")
         self.setMinimumWidth(500)
         self.setStyleSheet(DIALOG_STYLE)
-        # Prevent operator from closing via X button during capture
         self.setWindowFlags(
             Qt.Dialog | Qt.WindowTitleHint | Qt.CustomizeWindowHint
         )
@@ -627,10 +675,10 @@ class HwTriggerProgressDialog(QDialog):
         layout.setSpacing(16)
         layout.setContentsMargins(28, 24, 28, 20)
 
-        layout.addWidget(
-            make_label(f"Capturing  0 / {total}  hardware trigger images", 14, bold=True)
+        self._title_lbl = make_label(
+            f"Capturing  0 / {total}  hardware trigger images", 14, bold=True
         )
-        self._title_lbl = layout.itemAt(0).widget()
+        layout.addWidget(self._title_lbl)
 
         layout.addWidget(make_label(
             "Press the push button each time to trigger a capture.\n"
@@ -638,14 +686,12 @@ class HwTriggerProgressDialog(QDialog):
             11, color=CLR_TEXT_MUTED
         ))
 
-        # Progress bar
         self._bar = QProgressBar()
         self._bar.setRange(0, total)
         self._bar.setValue(0)
         self._bar.setFormat(f"0 / {total} captured")
         layout.addWidget(self._bar)
 
-        # Live thumbnail of last captured image
         self._thumb = QLabel()
         self._thumb.setAlignment(Qt.AlignCenter)
         self._thumb.setFixedHeight(220)
@@ -655,7 +701,6 @@ class HwTriggerProgressDialog(QDialog):
         self._thumb.setText("Waiting for first trigger …")
         layout.addWidget(self._thumb)
 
-        # Status label
         self._status_lbl = make_label("Waiting for push button …", 11, color=CLR_TEXT_MUTED)
         layout.addWidget(self._status_lbl)
 
@@ -665,7 +710,6 @@ class HwTriggerProgressDialog(QDialog):
         layout.addWidget(self._btn_abort, alignment=Qt.AlignRight)
 
     def update_progress(self, captured_count: int, last_frame: np.ndarray) -> None:
-        """Called from MainWindow slot after each trigger image is received."""
         self._captured = captured_count
         self._bar.setValue(captured_count)
         self._bar.setFormat(f"{captured_count} / {self._total} captured")
@@ -674,7 +718,6 @@ class HwTriggerProgressDialog(QDialog):
         )
         self._status_lbl.setText(f"Image {captured_count} saved  ✓")
 
-        # Update thumbnail
         if last_frame is not None:
             pix = _frame_to_pixmap(last_frame, max_w=460, max_h=210)
             self._thumb.setPixmap(pix)
